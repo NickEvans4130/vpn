@@ -1,0 +1,11 @@
+# Cross-compilation linker config for the Raspberry Pi 5 (aarch64) target.
+#
+# Run scripts/aarch64-cross-setup.sh once first -- it installs the
+# toolchain/sysroot, generates the libgcc_s shim (see that script for
+# why one's needed), and appends the correct absolute `-L` path below
+# for your machine (rustflags paths aren't cargo-relative, so this has
+# to be a real absolute path, which is why it's not pre-filled here).
+# Then: cargo build --release --target aarch64-unknown-linux-gnu
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

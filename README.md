@@ -137,6 +137,38 @@ journalctl -u pqvpn -f
 
 Dashboard is then reachable at `http://127.0.0.1:8787`.
 
+## Cross-compiling for Raspberry Pi 5 (aarch64)
+
+```
+rustup target add aarch64-unknown-linux-gnu
+scripts/aarch64-cross-setup.sh   # one-time: toolchain, sysroot, libgcc_s shim
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+Fedora's cross packages need three things stitched together that aren't
+wired up by default, which is what `aarch64-cross-setup.sh` automates:
+
+1. `gcc-aarch64-linux-gnu` / `binutils-aarch64-linux-gnu` -- the cross
+   compiler and linker.
+2. `sysroot-aarch64-fc43-glibc` -- the target's C library and headers.
+   It installs to `/usr/aarch64-redhat-linux/sys-root/fc43`, but the
+   cross-gcc looks for its sysroot at `/usr/aarch64-linux-gnu/sys-root`
+   (`aarch64-linux-gnu-gcc -print-sysroot`), so the script symlinks one
+   to the other.
+3. A shared `libgcc_s` -- the sysroot package only ships the static
+   `libgcc.a`, but rustc unconditionally passes `-lgcc_s` for glibc
+   targets. The script writes a linker script named `libgcc_s.so` (a
+   `GROUP ( libgcc.a )` shim) into `.cargo/aarch64-shim/` and points
+   `.cargo/config.toml`'s `rustflags` at it -- this path is
+   machine-specific, so it isn't pre-filled in the committed config.
+
+Verified end-to-end on this repo: a clean `cargo build --release
+--target aarch64-unknown-linux-gnu` produces
+`target/aarch64-unknown-linux-gnu/release/pqvpnd` as a real aarch64 ELF
+(`file` reports `ELF 64-bit LSB pie executable, ARM aarch64`). Running
+it on actual Pi 5 hardware hasn't been tested yet -- that's still a
+follow-up.
+
 ## License
 
 MIT, see `LICENSE`.

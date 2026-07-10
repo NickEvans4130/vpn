@@ -1,4 +1,5 @@
 /target
+/.cargo/aarch64-shim
 node_modules/
 web/dist/
 *.log
