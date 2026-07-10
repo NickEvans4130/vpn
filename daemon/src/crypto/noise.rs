@@ -24,11 +24,13 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce as AeadNonce};
 use hkdf::Hkdf;
+use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
+use ml_kem::{Ciphertext, EncapsulationKey, Kem, MlKem768};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
 use zeroize::Zeroize;
 
-const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_SHA256";
+const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_MLKEM768_ChaChaPoly_SHA256";
 
 /// A completed handshake, producing two independent transport keys — one
 /// for each direction — so a compromise of one direction's key doesn't
@@ -58,8 +60,13 @@ struct SymmetricState {
 impl SymmetricState {
     fn new() -> Self {
         // Noise spec: if protocol name <= HASHLEN, pad with zeros, else hash it.
-        let mut h = [0u8; 32];
-        h[..PROTOCOL_NAME.len()].copy_from_slice(PROTOCOL_NAME);
+        let h: [u8; 32] = if PROTOCOL_NAME.len() <= 32 {
+            let mut h = [0u8; 32];
+            h[..PROTOCOL_NAME.len()].copy_from_slice(PROTOCOL_NAME);
+            h
+        } else {
+            Sha256::digest(PROTOCOL_NAME).into()
+        };
         SymmetricState { ck: h, h }
     }
 
@@ -136,17 +143,28 @@ impl SymmetricState {
     }
 }
 
-/// Long-term identity for a peer: X25519 static keypair.
+/// Long-term identity for a peer: X25519 static keypair plus an ML-KEM-768
+/// static keypair. Both are treated as "static keys" in the IK sense --
+/// the initiator must know the responder's public halves of each ahead of
+/// time (e.g. from peer configuration).
 pub struct StaticIdentity {
     pub secret: StaticSecret,
     pub public: PublicKey,
+    pub kem_decap: ml_kem::DecapsulationKey768,
+    pub kem_encap: EncapsulationKey<MlKem768>,
 }
 
 impl StaticIdentity {
     pub fn generate() -> Self {
         let secret = StaticSecret::random();
         let public = PublicKey::from(&secret);
-        StaticIdentity { secret, public }
+        let (kem_decap, kem_encap) = MlKem768::generate_keypair();
+        StaticIdentity {
+            secret,
+            public,
+            kem_decap,
+            kem_encap,
+        }
     }
 }
 
@@ -159,13 +177,16 @@ pub struct InitiatorHandshake {
 pub struct ResponderHandshake {
     state: SymmetricState,
     s_priv_bytes: [u8; 32],
+    kem_decap: ml_kem::DecapsulationKey768,
     pending_ie: Option<PublicKey>,
     pending_is: Option<PublicKey>,
 }
 
-/// Message 1: e, es, s, ss — sent initiator -> responder.
+/// Message 1: e, es, s, ss, plus an ML-KEM-768 ciphertext encapsulated to
+/// the responder's known KEM public key — sent initiator -> responder.
 pub struct Message1 {
     pub e_pub: [u8; 32],
+    pub kem_ciphertext: Vec<u8>,
     pub encrypted_static: Vec<u8>,
     pub encrypted_payload: Vec<u8>,
 }
@@ -178,11 +199,16 @@ pub struct Message2 {
 
 impl InitiatorHandshake {
     /// Start a handshake as the initiator, given our own static identity
-    /// and the responder's known static public key.
-    pub fn start(local: &StaticIdentity, remote_static: PublicKey) -> (Self, Message1) {
+    /// and the responder's known static X25519 and ML-KEM-768 public keys.
+    pub fn start(
+        local: &StaticIdentity,
+        remote_static: PublicKey,
+        remote_kem_encap: &EncapsulationKey<MlKem768>,
+    ) -> (Self, Message1) {
         let mut state = SymmetricState::new();
-        // Pre-message: mix in the responder's known static public key.
+        // Pre-message: mix in the responder's known static public keys.
         state.mix_hash(remote_static.as_bytes());
+        state.mix_hash(&remote_kem_encap.to_bytes());
 
         let e_priv = ReusableSecret::random();
         let e_pub = PublicKey::from(&e_priv);
@@ -198,8 +224,15 @@ impl InitiatorHandshake {
         let key2 = state.mix_key(ss.as_bytes());
         let encrypted_payload = state.encrypt_and_hash(&key2, b"");
 
+        // kem = Encapsulate(remote's known static ML-KEM-768 key). Mixed
+        // in as a fourth root-key input alongside es/ss/(ee+se later),
+        // matching the design doc's HKDF(dh1||dh2||dh3||kem_secret).
+        let (kem_ciphertext, kem_secret) = remote_kem_encap.encapsulate();
+        state.mix_key(&kem_secret);
+
         let msg1 = Message1 {
             e_pub: *e_pub.as_bytes(),
+            kem_ciphertext: kem_ciphertext.to_vec(),
             encrypted_static,
             encrypted_payload,
         };
@@ -250,9 +283,11 @@ impl ResponderHandshake {
     pub fn new(local: &StaticIdentity) -> Self {
         let mut state = SymmetricState::new();
         state.mix_hash(local.public.as_bytes());
+        state.mix_hash(&local.kem_encap.to_bytes());
         ResponderHandshake {
             state,
             s_priv_bytes: local.secret.to_bytes(),
+            kem_decap: local.kem_decap.clone(),
             pending_ie: None,
             pending_is: None,
         }
@@ -277,6 +312,12 @@ impl ResponderHandshake {
 
         let ss = s_priv.diffie_hellman(&initiator_static);
         let key2 = self.state.mix_key(ss.as_bytes());
+
+        let kem_ct = Ciphertext::<MlKem768>::try_from(msg1.kem_ciphertext.as_slice())
+            .map_err(|_| anyhow::anyhow!("malformed ML-KEM-768 ciphertext"))?;
+        let kem_secret = self.kem_decap.decapsulate(&kem_ct);
+        self.state.mix_key(&kem_secret);
+
         let _payload = self
             .state
             .decrypt_and_hash(&key2, &msg1.encrypted_payload)?;
@@ -336,7 +377,7 @@ mod tests {
         let initiator_id = StaticIdentity::generate();
         let responder_id = StaticIdentity::generate();
 
-        let (init_hs, msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public);
+        let (init_hs, msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public, &responder_id.kem_encap);
 
         let mut resp_hs = ResponderHandshake::new(&responder_id);
         let learned_initiator_static = resp_hs.read_message1(&msg1).expect("msg1 decrypts");
@@ -355,7 +396,7 @@ mod tests {
         let initiator_id = StaticIdentity::generate();
         let responder_id = StaticIdentity::generate();
 
-        let (_init_hs, mut msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public);
+        let (_init_hs, mut msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public, &responder_id.kem_encap);
         // Flip a bit in the encrypted static key ciphertext.
         msg1.encrypted_static[0] ^= 0x01;
 

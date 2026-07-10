@@ -1,16 +1,24 @@
-//! Periodic DH ratchet: re-runs a fresh ephemeral X25519 exchange on a
-//! schedule (60s elapsed or 2^16 packets sent, whichever comes first) and
-//! mixes the result into a persistent root key. This gives
-//! post-compromise security -- an attacker who steals the current
-//! symmetric ratchet chain loses that advantage at the next rekey, without
-//! needing a full handshake. ML-KEM-768 gets folded into the same
-//! `finish_rekey` mix once the hybrid PQ milestone lands; the wire
-//! protocol and root-key mixing are already shaped for that so the swap
-//! doesn't require restructuring this module.
+//! Periodic DH+KEM ratchet: re-runs a fresh hybrid X25519 + ML-KEM-768
+//! exchange on a schedule (60s elapsed or 2^16 packets sent, whichever
+//! comes first) and mixes the result into a persistent root key. This
+//! gives post-compromise security -- an attacker who steals the current
+//! symmetric ratchet chain loses that advantage at the next rekey,
+//! without needing a full handshake.
+//!
+//! Unlike the initial Noise_IK handshake (where the responder's static
+//! KEM key is known ahead of time), a periodic rekey has no pre-shared
+//! KEM public key to encapsulate against -- so the exchange is
+//! necessarily one asymmetric round trip: the initiator generates a
+//! fresh ephemeral KEM keypair and offers its public half; the responder
+//! encapsulates against it and answers with the ciphertext. Both sides
+//! also exchange fresh X25519 ephemerals in the same messages, and the
+//! root key is re-derived from `HKDF(root_key, dh || kem_secret)`.
 
 use std::time::{Duration, Instant};
 
 use hkdf::Hkdf;
+use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport};
+use ml_kem::{Ciphertext, DecapsulationKey768, EncapsulationKey, Kem, MlKem768};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, ReusableSecret};
 use zeroize::Zeroize;
@@ -52,10 +60,26 @@ pub struct DhRatchetState {
     last_rekey: Instant,
 }
 
-/// A rekey exchange in progress: our fresh ephemeral has been generated
-/// and its public half sent to the peer; waiting on theirs.
+/// Sent initiator -> responder to start a rekey: a fresh X25519 ephemeral
+/// and a fresh, single-use ML-KEM-768 encapsulation key.
+pub struct RekeyOffer {
+    pub x_pub: PublicKey,
+    pub kem_ek_bytes: Vec<u8>,
+}
+
+/// Sent responder -> initiator to complete a rekey: the responder's own
+/// fresh X25519 ephemeral, plus the ML-KEM-768 ciphertext encapsulated
+/// against the initiator's offered key.
+pub struct RekeyResponse {
+    pub x_pub: PublicKey,
+    pub kem_ciphertext: Vec<u8>,
+}
+
+/// Initiator-side state held between offering a rekey and receiving the
+/// responder's answer.
 pub struct PendingRekey {
     local_eph: ReusableSecret,
+    kem_decap: DecapsulationKey768,
 }
 
 impl DhRatchetState {
@@ -87,26 +111,71 @@ impl DhRatchetState {
             || self.last_rekey.elapsed() >= self.policy.interval
     }
 
-    /// Start a rekey: generate a fresh ephemeral keypair, return the
-    /// public half to send to the peer alongside a handle to finish once
-    /// the peer's ephemeral arrives.
-    pub fn begin_rekey(&self) -> (PublicKey, PendingRekey) {
+    /// Initiator side: start a rekey by generating a fresh X25519
+    /// ephemeral and a fresh ML-KEM-768 keypair, offering the public
+    /// halves of both to the peer.
+    pub fn begin_rekey_as_initiator(&self) -> (RekeyOffer, PendingRekey) {
         let local_eph = ReusableSecret::random();
-        let local_pub = PublicKey::from(&local_eph);
-        (local_pub, PendingRekey { local_eph })
+        let x_pub = PublicKey::from(&local_eph);
+        let (kem_decap, kem_encap) = MlKem768::generate_keypair();
+        let offer = RekeyOffer {
+            x_pub,
+            kem_ek_bytes: kem_encap.to_bytes().to_vec(),
+        };
+        (offer, PendingRekey { local_eph, kem_decap })
     }
 
-    /// Complete a rekey once the peer's ephemeral public key is known.
-    /// Mixes the fresh DH output into the root key and derives new
-    /// send/recv ratchet chains, zeroing the old root key immediately.
-    pub fn finish_rekey(
+    /// Initiator side: complete the rekey once the responder has replied.
+    pub fn finish_rekey_as_initiator(
         &mut self,
         pending: PendingRekey,
-        peer_eph_pub: PublicKey,
-    ) -> (Ratchet, Ratchet) {
-        let dh = pending.local_eph.diffie_hellman(&peer_eph_pub);
+        response: RekeyResponse,
+    ) -> anyhow::Result<(Ratchet, Ratchet)> {
+        let dh = pending.local_eph.diffie_hellman(&response.x_pub);
+        let kem_ct = Ciphertext::<MlKem768>::try_from(response.kem_ciphertext.as_slice())
+            .map_err(|_| anyhow::anyhow!("malformed ML-KEM-768 ciphertext in rekey response"))?;
+        let kem_secret = pending.kem_decap.decapsulate(&kem_ct);
 
-        let hk = Hkdf::<Sha256>::new(Some(&self.root_key), dh.as_bytes());
+        Ok(self.mix_and_derive(dh.as_bytes(), &kem_secret))
+    }
+
+    /// Responder side: answer a rekey offer in one step -- generate a
+    /// fresh X25519 ephemeral, encapsulate against the initiator's
+    /// offered KEM key, mix both into the root key, and return the reply
+    /// to send back alongside the freshly derived ratchet chains.
+    pub fn respond_to_rekey(
+        &mut self,
+        offer: RekeyOffer,
+    ) -> anyhow::Result<(RekeyResponse, Ratchet, Ratchet)> {
+        let local_eph = ReusableSecret::random();
+        let x_pub = PublicKey::from(&local_eph);
+        let dh = local_eph.diffie_hellman(&offer.x_pub);
+
+        let peer_kem_ek = EncapsulationKey::<MlKem768>::new(
+            offer
+                .kem_ek_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("malformed ML-KEM-768 encapsulation key in rekey offer"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid ML-KEM-768 encapsulation key in rekey offer"))?;
+        let (kem_ciphertext, kem_secret) = peer_kem_ek.encapsulate();
+
+        let (send, recv) = self.mix_and_derive(dh.as_bytes(), &kem_secret);
+        let response = RekeyResponse {
+            x_pub,
+            kem_ciphertext: kem_ciphertext.to_vec(),
+        };
+        Ok((response, send, recv))
+    }
+
+    fn mix_and_derive(&mut self, dh: &[u8], kem_secret: &[u8]) -> (Ratchet, Ratchet) {
+        let mut ikm = Vec::with_capacity(dh.len() + kem_secret.len());
+        ikm.extend_from_slice(dh);
+        ikm.extend_from_slice(kem_secret);
+
+        let hk = Hkdf::<Sha256>::new(Some(&self.root_key), &ikm);
+        ikm.zeroize();
         let mut okm = [0u8; 96];
         hk.expand(&[], &mut okm).expect("hkdf expand within limit");
 
@@ -147,11 +216,12 @@ mod tests {
         let mut initiator = DhRatchetState::new(seed, Role::Initiator, RatchetPolicy::default());
         let mut responder = DhRatchetState::new(seed, Role::Responder, RatchetPolicy::default());
 
-        let (init_pub, init_pending) = initiator.begin_rekey();
-        let (resp_pub, resp_pending) = responder.begin_rekey();
-
-        let (mut init_send, mut init_recv) = initiator.finish_rekey(init_pending, resp_pub);
-        let (mut resp_send, mut resp_recv) = responder.finish_rekey(resp_pending, init_pub);
+        let (offer, pending) = initiator.begin_rekey_as_initiator();
+        let (response, mut resp_send, mut resp_recv) =
+            responder.respond_to_rekey(offer).expect("responder answers offer");
+        let (mut init_send, mut init_recv) = initiator
+            .finish_rekey_as_initiator(pending, response)
+            .expect("initiator finishes rekey");
 
         assert_eq!(init_send.advance(), resp_recv.advance());
         assert_eq!(resp_send.advance(), init_recv.advance());
@@ -161,24 +231,34 @@ mod tests {
 
     #[test]
     fn rekey_resets_packet_counter_and_clears_threshold_trigger() {
-        let mut state = DhRatchetState::new(
-            [9u8; 32],
+        let seed = [9u8; 32];
+        let mut initiator = DhRatchetState::new(
+            seed,
             Role::Initiator,
             RatchetPolicy {
                 interval: Duration::from_secs(3600),
                 packet_threshold: 10,
             },
         );
+        let mut responder = DhRatchetState::new(
+            seed,
+            Role::Responder,
+            RatchetPolicy {
+                interval: Duration::from_secs(3600),
+                packet_threshold: 10,
+            },
+        );
         for _ in 0..10 {
-            state.record_packet_sent();
+            initiator.record_packet_sent();
         }
-        assert!(state.should_rekey());
+        assert!(initiator.should_rekey());
 
-        let (pub_key, pending) = state.begin_rekey();
-        state.finish_rekey(pending, pub_key);
+        let (offer, pending) = initiator.begin_rekey_as_initiator();
+        let (response, _, _) = responder.respond_to_rekey(offer).unwrap();
+        initiator.finish_rekey_as_initiator(pending, response).unwrap();
 
-        assert_eq!(state.packets_since_rekey(), 0);
-        assert!(!state.should_rekey());
+        assert_eq!(initiator.packets_since_rekey(), 0);
+        assert!(!initiator.should_rekey());
     }
 
     #[test]

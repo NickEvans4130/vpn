@@ -79,7 +79,7 @@ mod tests {
         let initiator_id = StaticIdentity::generate();
         let responder_id = StaticIdentity::generate();
 
-        let (init_hs, msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public);
+        let (init_hs, msg1) = InitiatorHandshake::start(&initiator_id, responder_id.public, &responder_id.kem_encap);
         let mut resp_hs = ResponderHandshake::new(&responder_id);
         resp_hs.read_message1(&msg1).unwrap();
         let (msg2, responder_keys) = resp_hs.write_message2().unwrap();
