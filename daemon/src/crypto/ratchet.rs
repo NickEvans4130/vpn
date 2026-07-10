@@ -45,6 +45,59 @@ impl Drop for Ratchet {
     }
 }
 
+/// Wraps a receiving-side `Ratchet` with a bounded cache of "skipped"
+/// packet keys, so packets can be decrypted slightly out of order (up to
+/// `max_skip` positions ahead of the last consumed sequence number)
+/// without losing the single-use-key property. Keys are removed from the
+/// cache (and zeroized) the moment they're consumed or evicted, so at
+/// most `max_skip` keys are ever retained -- there is still no long-term
+/// key history.
+pub struct ReceivingChain {
+    ratchet: Ratchet,
+    next_seq: u64,
+    skipped: std::collections::BTreeMap<u64, [u8; 32]>,
+    max_skip: u64,
+}
+
+impl ReceivingChain {
+    pub fn new(chain_key: [u8; 32], max_skip: u64) -> Self {
+        ReceivingChain {
+            ratchet: Ratchet::new(chain_key),
+            next_seq: 0,
+            skipped: std::collections::BTreeMap::new(),
+            max_skip,
+        }
+    }
+
+    /// Return the packet key for `seq`, deriving forward and caching any
+    /// intermediate keys as needed. Returns `None` if `seq` has already
+    /// been consumed and evicted, or is further ahead than `max_skip`
+    /// (a cheap guard against an attacker forcing unbounded key caching).
+    pub fn key_for_seq(&mut self, seq: u64) -> Option<[u8; 32]> {
+        if seq < self.next_seq {
+            return self.skipped.remove(&seq);
+        }
+        if seq - self.next_seq > self.max_skip {
+            return None;
+        }
+        while self.next_seq < seq {
+            let key = self.ratchet.advance();
+            self.skipped.insert(self.next_seq, key);
+            self.next_seq += 1;
+            while self.skipped.len() as u64 > self.max_skip {
+                if let Some((&oldest, _)) = self.skipped.iter().next() {
+                    if let Some(mut evicted) = self.skipped.remove(&oldest) {
+                        evicted.zeroize();
+                    }
+                }
+            }
+        }
+        let key = self.ratchet.advance();
+        self.next_seq += 1;
+        Some(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +120,43 @@ mod tests {
         for _ in 0..1000 {
             assert_eq!(a.advance(), b.advance());
         }
+    }
+
+    #[test]
+    fn receiving_chain_matches_sending_chain_in_order() {
+        let mut send = Ratchet::new([1u8; 32]);
+        let mut recv = ReceivingChain::new([1u8; 32], 64);
+        for seq in 0..20u64 {
+            let sent = send.advance();
+            let got = recv.key_for_seq(seq).unwrap();
+            assert_eq!(sent, got);
+        }
+    }
+
+    #[test]
+    fn receiving_chain_handles_reordering_within_skip_window() {
+        let mut send = Ratchet::new([2u8; 32]);
+        let expected: Vec<[u8; 32]> = (0..5).map(|_| send.advance()).collect();
+
+        let mut recv = ReceivingChain::new([2u8; 32], 64);
+        // Arrive out of order: 2, 0, 1, 4, 3.
+        assert_eq!(recv.key_for_seq(2).unwrap(), expected[2]);
+        assert_eq!(recv.key_for_seq(0).unwrap(), expected[0]);
+        assert_eq!(recv.key_for_seq(1).unwrap(), expected[1]);
+        assert_eq!(recv.key_for_seq(4).unwrap(), expected[4]);
+        assert_eq!(recv.key_for_seq(3).unwrap(), expected[3]);
+    }
+
+    #[test]
+    fn receiving_chain_rejects_key_reuse_after_consumption() {
+        let mut recv = ReceivingChain::new([3u8; 32], 64);
+        recv.key_for_seq(0).unwrap();
+        assert!(recv.key_for_seq(0).is_none());
+    }
+
+    #[test]
+    fn receiving_chain_rejects_jump_beyond_max_skip() {
+        let mut recv = ReceivingChain::new([4u8; 32], 8);
+        assert!(recv.key_for_seq(100).is_none());
     }
 }
