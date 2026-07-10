@@ -1,0 +1,44 @@
+[Unit]
+Description=pqvpn - post-quantum VPN daemon
+Documentation=https://github.com/NickEvans4130/vpn
+# Start after basic networking is up, but don't block on NetworkManager
+# finishing -- pqvpn uses policy routing, not the default route, so it
+# doesn't need to race NM for control.
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/pqvpn/pqvpn.env
+ExecStart=/usr/local/bin/pqvpnd \
+    --tun-name ${PQVPN_TUN_NAME} \
+    --tun-addr ${PQVPN_TUN_ADDR} \
+    --tun-prefix ${PQVPN_TUN_PREFIX} \
+    --listen ${PQVPN_LISTEN} \
+    --peer ${PQVPN_PEER} \
+    --dashboard-static /usr/local/share/pqvpn/web
+
+Restart=on-failure
+RestartSec=2
+
+# Run as an unprivileged system user; grant only CAP_NET_ADMIN (needed to
+# create/configure the TUN device and adjust routing) instead of running
+# as root. See README.md's Fedora section for the alternative
+# `setcap cap_net_admin+ep` approach if you'd rather not add a system
+# user.
+User=pqvpn
+Group=pqvpn
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Sandboxing -- tighten the daemon's view of the system since it only
+# needs network access and its own state directory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=pqvpn
+RuntimeDirectory=pqvpn
+
+[Install]
+WantedBy=multi-user.target

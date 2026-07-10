@@ -48,6 +48,95 @@ Primary target is Fedora (daily driver). Also runs on Ubuntu Server for
 homelab exit-node deployment, with an aarch64 cross-compile target for
 Raspberry Pi 5.
 
+## Fedora install
+
+`scripts/install-fedora.sh` automates the steps below -- run it from the
+repo root, or follow them by hand.
+
+### Dependencies
+
+```
+sudo dnf install -y gcc pkgconf-pkg-config systemd-devel iproute
+```
+
+Rust itself isn't packaged via `dnf` here -- install it with
+[rustup](https://rustup.rs) if you don't already have it.
+
+### Build
+
+```
+cargo build --release
+```
+
+Produces `target/release/pqvpnd`.
+
+### Running without root: CAP_NET_ADMIN
+
+`pqvpnd` needs `CAP_NET_ADMIN` to create and configure the TUN device --
+it should never need to run as root. Two ways to grant it:
+
+- **systemd** (recommended, see `packaging/pqvpn.service`): runs as a
+  dedicated unprivileged `pqvpn` system user with
+  `AmbientCapabilities=CAP_NET_ADMIN` and `CapabilityBoundingSet=CAP_NET_ADMIN`.
+- **Manual/testing**: `sudo setcap cap_net_admin+ep /usr/local/bin/pqvpnd`,
+  then run the binary as your normal user.
+
+### SELinux
+
+Fedora's default enforcing SELinux policy generally allows TUN device
+creation (`/dev/net/tun`) without extra configuration when the process
+holds `CAP_NET_ADMIN` the ways above. If you see a TUN-related denial:
+
+```
+sudo ausearch -m avc -ts recent | audit2why
+```
+
+If it flags a `tun_device` denial for a custom install path, either
+relabel the binary to a standard context or generate a local policy
+module for it:
+
+```
+sudo ausearch -m avc -ts recent | audit2allow -M pqvpn_local
+sudo semodule -i pqvpn_local.pp
+```
+
+Avoid `setenforce 0` (disabling SELinux entirely) -- scope the fix to
+the actual denial instead.
+
+### Coexisting with NetworkManager
+
+`pqvpnd` doesn't touch the system's default route. Instead:
+
+1. **Tell NetworkManager to ignore the TUN interface** so it doesn't try
+   to DHCP it or reset it on a network change:
+   ```
+   sudo cp packaging/NetworkManager-pqvpn.conf /etc/NetworkManager/conf.d/pqvpn.conf
+   sudo systemctl reload NetworkManager
+   ```
+2. **Route VPN traffic via a separate table**, selected by an `ip rule`,
+   rather than overwriting the main default route (which NM would just
+   revert on the next network change):
+   ```
+   sudo scripts/pqvpn-routing.sh up pqvpn0 <tun-peer-gateway>
+   ```
+   See `scripts/pqvpn-routing.sh` for the underlying `ip rule`/`ip route`
+   commands, and wire it into `ExecStartPost=`/`ExecStopPost=` in the
+   systemd unit if you want it applied automatically.
+
+### systemd service
+
+```
+sudo cp packaging/pqvpn.service /etc/systemd/system/pqvpn.service
+sudo mkdir -p /etc/pqvpn
+sudo cp packaging/pqvpn.env.example /etc/pqvpn/pqvpn.env
+# edit /etc/pqvpn/pqvpn.env with your peer address and TUN settings
+sudo systemctl daemon-reload
+sudo systemctl enable --now pqvpn
+journalctl -u pqvpn -f
+```
+
+Dashboard is then reachable at `http://127.0.0.1:8787`.
+
 ## License
 
 MIT, see `LICENSE`.
