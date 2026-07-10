@@ -1,3 +1,4 @@
+mod crypto;
 mod tun;
 
 use std::net::{Ipv4Addr, SocketAddr};
