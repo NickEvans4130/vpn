@@ -36,12 +36,17 @@ const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_SHA256";
 pub struct TransportKeys {
     pub send_key: [u8; 32],
     pub recv_key: [u8; 32],
+    /// The handshake's final chaining key, kept around as the seed for
+    /// the periodic DH(+KEM) ratchet -- separate from send/recv so a
+    /// leaked transport key doesn't also leak the ratchet's root.
+    pub root_key: [u8; 32],
 }
 
 impl Drop for TransportKeys {
     fn drop(&mut self) {
         self.send_key.zeroize();
         self.recv_key.zeroize();
+        self.root_key.zeroize();
     }
 }
 
@@ -114,6 +119,10 @@ impl SymmetricState {
     /// identical -- callers must assign send/recv per their handshake
     /// role (initiator sends with k1/recvs with k2, responder is mirrored),
     /// same as Noise's `Split()`.
+    fn root_key(&self) -> [u8; 32] {
+        self.ck
+    }
+
     fn split(&self) -> ([u8; 32], [u8; 32]) {
         let hk = Hkdf::<Sha256>::new(Some(&self.ck), &[]);
         let mut okm = [0u8; 64];
@@ -227,10 +236,12 @@ impl InitiatorHandshake {
         let _payload = state.decrypt_and_hash(&key2, &msg2.encrypted_payload)?;
 
         // Initiator: send with k1, receive with k2.
+        let root_key = state.root_key();
         let (k1, k2) = state.split();
         Ok(TransportKeys {
             send_key: k1,
             recv_key: k2,
+            root_key,
         })
     }
 }
@@ -299,10 +310,12 @@ impl ResponderHandshake {
         let encrypted_payload = self.state.encrypt_and_hash(&key2, b"");
 
         // Responder is the mirror of the initiator: send with k2, receive with k1.
+        let root_key = self.state.root_key();
         let (k1, k2) = self.state.split();
         let keys = TransportKeys {
             send_key: k2,
             recv_key: k1,
+            root_key,
         };
         Ok((
             Message2 {
