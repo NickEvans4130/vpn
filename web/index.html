@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pqvpn</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="shell">
+  <nav class="rail">
+    <div class="brand">
+      <span class="brand-mark">pq</span>
+      <span class="brand-name">pqvpn</span>
+    </div>
+    <button class="nav-item active" data-tab="status">
+      <span class="nav-dot"></span>Status
+    </button>
+    <button class="nav-item" data-tab="peers">
+      <span class="nav-dot"></span>Peers
+    </button>
+    <button class="nav-item" data-tab="security">
+      <span class="nav-dot"></span>Security
+    </button>
+    <button class="nav-item" data-tab="settings">
+      <span class="nav-dot"></span>Settings
+    </button>
+    <div class="rail-footer">
+      <div class="conn-pill" id="conn-pill">
+        <span class="conn-dot"></span>
+        <span id="conn-label">connecting…</span>
+      </div>
+    </div>
+  </nav>
+
+  <main class="content">
+
+    <section id="tab-status" class="tab active">
+      <header class="page-head">
+        <h1>Status</h1>
+        <p class="page-sub">Current session at a glance.</p>
+      </header>
+
+      <div class="card-grid">
+        <div class="card stat-card">
+          <div class="stat-label">Connection</div>
+          <div class="stat-value" id="stat-connection">—</div>
+          <div class="stat-foot" id="stat-peer">no peer</div>
+        </div>
+        <div class="card stat-card">
+          <div class="stat-label">Uptime</div>
+          <div class="stat-value" id="stat-uptime">00:00:00</div>
+          <div class="stat-foot">this session</div>
+        </div>
+        <div class="card stat-card">
+          <div class="stat-label">Ratchet epoch</div>
+          <div class="stat-value accent" id="stat-epoch">0</div>
+          <div class="stat-foot" id="stat-epoch-foot">DH+KEM rekeys this session</div>
+        </div>
+        <div class="card stat-card">
+          <div class="stat-label">Throughput</div>
+          <div class="stat-value" id="stat-throughput">0.0 KB/s</div>
+          <div class="stat-foot" id="stat-throughput-foot">tx + rx combined</div>
+        </div>
+      </div>
+
+      <div class="card graph-card">
+        <div class="card-head">
+          <h2>Throughput</h2>
+          <span class="card-head-sub">last 60s</span>
+        </div>
+        <svg id="throughput-graph" viewBox="0 0 600 140" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <section id="tab-peers" class="tab">
+      <header class="page-head">
+        <h1>Peers</h1>
+        <p class="page-sub">Configured peers and their static public keys.</p>
+      </header>
+
+      <div class="peer-list" id="peer-list"></div>
+
+      <button class="btn-primary" id="add-peer-btn">+ Add peer</button>
+    </section>
+
+    <section id="tab-security" class="tab">
+      <header class="page-head">
+        <h1>Security</h1>
+        <p class="page-sub">Live ratchet state — this is the part that matters.</p>
+      </header>
+
+      <div class="lattice-bg">
+        <div class="card-grid">
+          <div class="card sec-card">
+            <div class="stat-label">Last rekey</div>
+            <div class="stat-value" id="sec-last-rekey">—</div>
+          </div>
+          <div class="card sec-card">
+            <div class="stat-label">Packets since last rekey</div>
+            <div class="stat-value" id="sec-packets-since">0</div>
+            <div class="progress-track">
+              <div class="progress-fill" id="sec-packets-progress"></div>
+            </div>
+          </div>
+          <div class="card sec-card">
+            <div class="stat-label">PQ handshake</div>
+            <div class="stat-value" id="sec-pq-status">
+              <span class="badge badge-ok">ML-KEM-768 ✓</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-list">
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-name">Obfuscation</div>
+              <div class="toggle-desc">Wire packets shaped to look like DTLS records</div>
+            </div>
+            <span class="badge badge-ok" id="sec-obfuscation">active</span>
+          </div>
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-name">Constant-size padding</div>
+              <div class="toggle-desc">All packets padded to a fixed MTU before encryption</div>
+            </div>
+            <span class="badge badge-ok" id="sec-padding">active</span>
+          </div>
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-name">Cover traffic</div>
+              <div class="toggle-desc">Fixed-rate dummy packets during idle periods</div>
+            </div>
+            <span class="badge badge-off" id="sec-cover-traffic">off</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="tab">
+      <header class="page-head">
+        <h1>Settings</h1>
+        <p class="page-sub">Hardening features and rekey thresholds.</p>
+      </header>
+
+      <div class="settings-list">
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Obfuscation</div>
+            <div class="toggle-desc">Disguise wire packets as DTLS application data</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="setting-obfuscation" checked />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Constant-size padding</div>
+            <div class="toggle-desc">Pad every packet to a fixed size before encryption</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="setting-padding" checked />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Cover traffic</div>
+            <div class="toggle-desc">Send dummy packets at a fixed rate when idle (uses bandwidth)</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="setting-cover-traffic" />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Padding size</div>
+            <div class="toggle-desc">Target packet size in bytes</div>
+          </div>
+          <input type="number" class="settings-input" id="setting-pad-size" value="1400" />
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Rekey interval</div>
+            <div class="toggle-desc">Seconds between periodic DH+KEM ratchets</div>
+          </div>
+          <input type="number" class="settings-input" id="setting-rekey-interval" value="60" />
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="toggle-name">Rekey packet threshold</div>
+            <div class="toggle-desc">Packets sent before a periodic ratchet, whichever comes first</div>
+          </div>
+          <input type="number" class="settings-input" id="setting-rekey-packets" value="65536" />
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
