@@ -10,3 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tun-rs = { version = "2.8.7", features = ["async_tokio"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
