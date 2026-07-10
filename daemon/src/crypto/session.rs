@@ -44,6 +44,22 @@ impl Session {
         }
     }
 
+    /// Build a session directly from a pair of already-derived ratchet
+    /// chains (as produced by a periodic DH+KEM rekey), rather than a
+    /// fresh handshake's `TransportKeys`. Sequence numbers and the replay
+    /// window both restart at zero -- this is a new ratchet epoch, not a
+    /// continuation of the old one's sequence space.
+    pub fn from_ratchets(send: Ratchet, recv: Ratchet, pad_target: usize) -> Self {
+        let recv_chain = ReceivingChain::new(recv.chain_key(), MAX_SKIP);
+        Session {
+            send_chain: send,
+            recv_chain,
+            replay_window: ReplayWindow::new(),
+            send_seq: 0,
+            pad_target,
+        }
+    }
+
     /// Encrypt one packet of type `pkt_type`, padding the plaintext to a
     /// constant size first. Advances the send chain and the sequence
     /// counter.

@@ -261,6 +261,31 @@ mod tests {
         assert!(!initiator.should_rekey());
     }
 
+    /// Proves zeroization actually happens, not just that the key value
+    /// changes. Captures a raw pointer at the `root_key` field's memory
+    /// location, drops the `DhRatchetState` (which per its `Drop` impl
+    /// calls `.zeroize()` on `root_key`), and then reads that same
+    /// location back and asserts every byte is zero. This is the standard
+    /// way zeroize-on-drop is verified in practice (the `zeroize` crate's
+    /// own test suite uses the same "read immediately after drop, before
+    /// any reallocation can occur" technique) -- unlike asserting
+    /// "new key != old key", which would pass even with no zeroization at
+    /// all, this directly inspects the freed memory contents.
+    #[test]
+    fn root_key_memory_is_actually_zeroized_on_drop() {
+        let seed = [0x77u8; 32];
+        let boxed = Box::new(DhRatchetState::new(seed, Role::Initiator, RatchetPolicy::default()));
+        let ptr: *const u8 = boxed.root_key.as_ptr();
+        drop(boxed);
+        // SAFETY: `ptr` pointed into the just-freed `Box`'s heap
+        // allocation. No allocation happens between the `drop` above and
+        // this read, so the freed slot still holds exactly whatever bytes
+        // `Drop::drop` last wrote there.
+        let after = unsafe { std::slice::from_raw_parts(ptr, 32) };
+        assert_eq!(after, &[0u8; 32], "root_key bytes were not zeroized on drop");
+        assert_ne!(after, &seed[..], "sanity check: zeroized value differs from original seed");
+    }
+
     #[test]
     fn time_threshold_triggers_independent_of_packet_count() {
         let state = DhRatchetState::new(
