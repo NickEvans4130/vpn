@@ -201,9 +201,10 @@ pub async fn handshake_as_initiator(
         match tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) if from == peer => {
                 if let Ok(msg2) = decode_message2(&buf[..n]) {
-                    // Clone so a failed auth/finish attempt doesn't corrupt
-                    // `hs`'s transcript state -- we need it intact to retry.
-                    match hs.clone().finish(msg2) {
+                    // `finish` borrows `hs` and only clones its transient
+                    // transcript state internally, so a failed attempt
+                    // doesn't consume or corrupt `hs` -- safe to retry.
+                    match hs.finish(msg2) {
                         Ok(keys) => return Ok(keys),
                         Err(_) => continue, // auth failure; keep retrying
                     }

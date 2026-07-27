@@ -58,6 +58,13 @@ struct SymmetricState {
     h: [u8; 32],
 }
 
+impl Drop for SymmetricState {
+    fn drop(&mut self) {
+        self.ck.zeroize();
+        self.h.zeroize();
+    }
+}
+
 impl SymmetricState {
     fn new() -> Self {
         // Noise spec: if protocol name <= HASHLEN, pad with zeros, else hash it.
@@ -169,7 +176,6 @@ impl StaticIdentity {
     }
 }
 
-#[derive(Clone)]
 pub struct InitiatorHandshake {
     state: SymmetricState,
     e_priv: ReusableSecret,
@@ -249,22 +255,24 @@ impl InitiatorHandshake {
         )
     }
 
-    pub fn finish(self, msg2: Message2) -> anyhow::Result<TransportKeys> {
-        let InitiatorHandshake {
-            mut state,
-            e_priv,
-            s_priv_bytes,
-        } = self;
+    /// Borrows rather than consumes `self` so a failed attempt (e.g. a
+    /// tampered/mismatched message2) can be retried without re-deriving
+    /// or copying the long-lived secret material (`e_priv`,
+    /// `s_priv_bytes`) -- only a transient clone of the transcript state
+    /// is taken per attempt, and that clone is zeroized on drop
+    /// regardless of whether this call succeeds or fails.
+    pub fn finish(&self, msg2: Message2) -> anyhow::Result<TransportKeys> {
+        let mut state = self.state.clone();
 
         let re = PublicKey::from(msg2.e_pub);
         state.mix_hash(re.as_bytes());
 
         // ee = DH(e, re)
-        let ee = e_priv.diffie_hellman(&re);
+        let ee = self.e_priv.diffie_hellman(&re);
         state.mix_key(ee.as_bytes());
 
         // se = DH(s, re)
-        let s_priv = StaticSecret::from(s_priv_bytes);
+        let s_priv = StaticSecret::from(self.s_priv_bytes);
         let se = s_priv.diffie_hellman(&re);
         let key2 = state.mix_key(se.as_bytes());
 
