@@ -179,7 +179,7 @@ impl StaticIdentity {
 pub struct InitiatorHandshake {
     state: SymmetricState,
     e_priv: ReusableSecret,
-    s_priv_bytes: [u8; 32],
+    s_priv: StaticSecret,
 }
 
 pub struct ResponderHandshake {
@@ -249,7 +249,7 @@ impl InitiatorHandshake {
             InitiatorHandshake {
                 state,
                 e_priv,
-                s_priv_bytes: local.secret.to_bytes(),
+                s_priv: local.secret.clone(),
             },
             msg1,
         )
@@ -257,10 +257,13 @@ impl InitiatorHandshake {
 
     /// Borrows rather than consumes `self` so a failed attempt (e.g. a
     /// tampered/mismatched message2) can be retried without re-deriving
-    /// or copying the long-lived secret material (`e_priv`,
-    /// `s_priv_bytes`) -- only a transient clone of the transcript state
-    /// is taken per attempt, and that clone is zeroized on drop
-    /// regardless of whether this call succeeds or fails.
+    /// or copying the long-lived secret material (`e_priv`, `s_priv`) --
+    /// only a transient clone of the transcript state is taken per
+    /// attempt, and that clone is zeroized on drop regardless of whether
+    /// this call succeeds or fails. `e_priv`/`s_priv` themselves are
+    /// zeroized on drop by `x25519-dalek`'s `zeroize` feature once this
+    /// handshake is retired (either via `finish` returning or the whole
+    /// `InitiatorHandshake` being dropped).
     pub fn finish(&self, msg2: Message2) -> anyhow::Result<TransportKeys> {
         let mut state = self.state.clone();
 
@@ -272,8 +275,7 @@ impl InitiatorHandshake {
         state.mix_key(ee.as_bytes());
 
         // se = DH(s, re)
-        let s_priv = StaticSecret::from(self.s_priv_bytes);
-        let se = s_priv.diffie_hellman(&re);
+        let se = self.s_priv.diffie_hellman(&re);
         let key2 = state.mix_key(se.as_bytes());
 
         let _payload = state.decrypt_and_hash(&key2, &msg2.encrypted_payload)?;
