@@ -149,11 +149,14 @@ impl VpnSession {
         let session = Session::from_ratchets(send, recv, self.pad_target);
         self.sessions.insert(new_epoch, session);
         self.epoch = new_epoch;
-        while self.sessions.len() > EPOCH_GRACE {
-            if let Some(&oldest) = self.sessions.keys().next() {
-                self.sessions.remove(&oldest);
-            }
-        }
+        // Retain only the current epoch and its immediate predecessor
+        // (EPOCH_GRACE == 2). Evicting by numeric BTreeMap key order would
+        // misbehave across the 255 -> 0 wraparound, where the newest epoch
+        // (0) sorts as the smallest key; retain by identity instead.
+        debug_assert_eq!(EPOCH_GRACE, 2);
+        let previous_epoch = self.epoch.wrapping_sub(1);
+        self.sessions
+            .retain(|&epoch, _| epoch == self.epoch || epoch == previous_epoch);
     }
 
     pub fn epoch(&self) -> u8 {

@@ -52,6 +52,7 @@ impl Drop for TransportKeys {
     }
 }
 
+#[derive(Clone)]
 struct SymmetricState {
     ck: [u8; 32],
     h: [u8; 32],
@@ -168,6 +169,7 @@ impl StaticIdentity {
     }
 }
 
+#[derive(Clone)]
 pub struct InitiatorHandshake {
     state: SymmetricState,
     e_priv: ReusableSecret,

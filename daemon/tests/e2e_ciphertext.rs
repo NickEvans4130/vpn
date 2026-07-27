@@ -180,7 +180,10 @@ async fn full_round_trip_multiple_packets_both_directions() {
             .await
             .unwrap();
         let mut buf = [0u8; 4096];
-        let (n, _) = responder_socket.recv_from(&mut buf).await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), responder_socket.recv_from(&mut buf))
+            .await
+            .expect("recv within timeout")
+            .unwrap();
         let decrypted = decrypt_captured(&mut responder_session, &obfuscator, &buf[..n]).unwrap();
         assert_eq!(decrypted, *payload);
     }
@@ -190,7 +193,10 @@ async fn full_round_trip_multiple_packets_both_directions() {
         .await
         .unwrap();
     let mut buf = [0u8; 4096];
-    let (n, _) = initiator_socket.recv_from(&mut buf).await.unwrap();
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), initiator_socket.recv_from(&mut buf))
+        .await
+        .expect("recv within timeout")
+        .unwrap();
     let decrypted = decrypt_captured(&mut initiator_session, &obfuscator, &buf[..n]).unwrap();
     assert_eq!(decrypted, b"reply");
 }
