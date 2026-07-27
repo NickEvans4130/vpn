@@ -1,7 +1,9 @@
 pub mod dh_ratchet;
+pub mod handshake_wire;
 pub mod noise;
 pub mod obfuscation;
 pub mod padding;
 pub mod ratchet;
 pub mod replay;
 pub mod session;
+pub mod vpn_session;

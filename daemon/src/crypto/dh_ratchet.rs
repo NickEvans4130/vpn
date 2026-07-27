@@ -261,6 +261,39 @@ mod tests {
         assert!(!initiator.should_rekey());
     }
 
+    /// Proves zeroization actually happens, not just that the key value
+    /// changes. Constructs the state inside a `MaybeUninit` (storage that
+    /// stays allocated and valid even after the value inside it is
+    /// dropped), captures a raw pointer at the `root_key` field, calls
+    /// `drop_in_place` (running `Drop`, which per its impl calls
+    /// `.zeroize()` on `root_key`), and then reads that same location
+    /// back and asserts every byte is zero. Unlike asserting "new key !=
+    /// old key", which would pass even with no zeroization at all, this
+    /// directly inspects the memory contents post-drop -- without ever
+    /// reading through freed/deallocated memory, since `MaybeUninit`'s
+    /// storage is never deallocated here.
+    #[test]
+    fn root_key_memory_is_actually_zeroized_on_drop() {
+        let seed = [0x77u8; 32];
+        let mut storage = std::mem::MaybeUninit::new(DhRatchetState::new(
+            seed,
+            Role::Initiator,
+            RatchetPolicy::default(),
+        ));
+        // SAFETY: `storage` was just initialized via `MaybeUninit::new`.
+        let ptr: *const u8 = unsafe { storage.assume_init_ref() }.root_key.as_ptr();
+        unsafe {
+            std::ptr::drop_in_place(storage.as_mut_ptr());
+        }
+        // SAFETY: `ptr` points into `storage`, which is still allocated
+        // (it's a local `MaybeUninit`, not a `Box` that got freed). Only
+        // the value inside was dropped via `drop_in_place`, so the bytes
+        // `Drop::drop` last wrote there are still readable.
+        let after = unsafe { std::slice::from_raw_parts(ptr, 32) };
+        assert_eq!(after, &[0u8; 32], "root_key bytes were not zeroized on drop");
+        assert_ne!(after, &seed[..], "sanity check: zeroized value differs from original seed");
+    }
+
     #[test]
     fn time_threshold_triggers_independent_of_packet_count() {
         let state = DhRatchetState::new(

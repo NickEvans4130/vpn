@@ -14,7 +14,11 @@
 //! DTLS 1.2 record header (RFC 6347 §4.1): `ContentType(1) |
 //! ProtocolVersion(2) | Epoch(2) | SequenceNumber(6) | Length(2)`.
 
-const DTLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 23;
+/// Exposed so callers outside this module (the `main.rs` packet loop) can
+/// peek at a datagram's first byte to tell an obfuscated data packet
+/// apart from an unobfuscated control-plane message sharing the same UDP
+/// socket, without needing to know which mode is active ahead of time.
+pub const DTLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 23;
 const DTLS_1_2_VERSION: [u8; 2] = [0xfe, 0xfd];
 const HEADER_LEN: usize = 1 + 2 + 2 + 6 + 2;
 

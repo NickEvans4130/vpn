@@ -1,22 +1,30 @@
-mod crypto;
-mod tun;
-mod web;
-
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
-use crate::tun::Tun;
-use crate::web::{DashboardState, SharedDashboardState};
+use pqvpn::crypto::dh_ratchet::Role;
+use pqvpn::crypto::handshake_wire;
+use pqvpn::crypto::noise::StaticIdentity;
+use pqvpn::crypto::obfuscation::{Obfuscator, DTLS_CONTENT_TYPE_APPLICATION_DATA};
+use pqvpn::crypto::vpn_session::VpnSession;
+use pqvpn::tun::Tun;
+use pqvpn::web::{DashboardState, SharedDashboardState};
 
-/// Milestone 2: plaintext TUN <-> UDP passthrough, no crypto yet.
-/// Proves the packet plumbing works before the ratchet/AEAD layers are added.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RoleArg {
+    Initiator,
+    Responder,
+}
+
+/// Milestone 12: real encrypted TUN <-> UDP forwarding. Plaintext never
+/// touches the wire -- see `crypto::vpn_session::VpnSession` for the
+/// single source of truth the packet loop below reads/mutates.
 #[derive(Parser, Debug)]
 #[command(name = "pqvpnd")]
 struct Args {
@@ -55,6 +63,18 @@ struct Args {
     /// Disable the local web dashboard
     #[arg(long)]
     no_dashboard: bool,
+
+    /// Which side of the Noise_IK handshake this instance plays. The
+    /// initiator starts the exchange (and later, periodic rekeys); the
+    /// responder waits for it. Exactly one side of a link must be each.
+    #[arg(long, value_enum)]
+    role: RoleArg,
+
+    /// Wrap outbound data packets in a fake-DTLS record header to defeat
+    /// byte-pattern DPI classifiers. Off by default: it adds a small
+    /// per-packet header and does nothing useful on an unfiltered link.
+    #[arg(long)]
+    obfuscate: bool,
 }
 
 #[tokio::main]
@@ -71,7 +91,41 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let socket = Arc::new(UdpSocket::bind(args.listen).await?);
-    println!("udp listening on {}, forwarding to peer {}", args.listen, args.peer);
+    println!("udp listening on {}, peer {}", args.listen, args.peer);
+
+    let role = match args.role {
+        RoleArg::Initiator => Role::Initiator,
+        RoleArg::Responder => Role::Responder,
+    };
+
+    // See `crypto::handshake_wire::exchange_hello`'s doc comment: this
+    // bootstrap step is a known, flagged gap (no peer-key provisioning
+    // system exists yet), not a design decision to treat as final.
+    let local_identity = StaticIdentity::generate();
+    println!("bootstrapping static keys with {} (see design notes: TOFU, not MITM-safe)...", args.peer);
+    let (peer_static, peer_kem_encap) = handshake_wire::exchange_hello(&socket, args.peer, &local_identity).await?;
+
+    println!("running Noise_IK handshake as {:?}...", args.role);
+    let transport_keys = match role {
+        Role::Initiator => {
+            handshake_wire::handshake_as_initiator(&socket, args.peer, &local_identity, peer_static, &peer_kem_encap)
+                .await?
+        }
+        Role::Responder => {
+            let (keys, from) = handshake_wire::handshake_as_responder(&socket, &local_identity).await?;
+            if from != args.peer {
+                anyhow::bail!(
+                    "handshake initiator {from} does not match configured peer {}",
+                    args.peer
+                );
+            }
+            keys
+        }
+    };
+    println!("handshake complete, encrypted transport session established");
+
+    let session = Arc::new(Mutex::new(VpnSession::new(transport_keys, role)));
+    let obfuscator = Arc::new(Obfuscator::new(args.obfuscate));
 
     let tun = Arc::new(tun);
     let tx_bytes = Arc::new(AtomicU64::new(0));
@@ -84,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     if !args.no_dashboard {
-        let router = web::router(dashboard_state.clone(), args.dashboard_static.clone());
+        let router = pqvpn::web::router(dashboard_state.clone(), args.dashboard_static.clone());
         let bind = args.dashboard_bind;
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(bind).await {
@@ -98,13 +152,6 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Note: the daemon doesn't run the crypto handshake/ratchet on this
-        // path yet (still plaintext passthrough per the build order), so
-        // there's no real ratchet epoch to report. This just turns byte
-        // counters from the forwarding loops into a live throughput graph
-        // so the dashboard's wiring is provably correct end to end; the
-        // ratchet fields get fed from the real DhRatchetState once the
-        // transport loop is upgraded to use it.
         let dashboard_state = dashboard_state.clone();
         let tx_bytes = tx_bytes.clone();
         let rx_bytes = rx_bytes.clone();
@@ -130,14 +177,41 @@ async fn main() -> anyhow::Result<()> {
         let socket = socket.clone();
         let peer = args.peer;
         let tx_bytes = tx_bytes.clone();
+        let session = session.clone();
+        let obfuscator = obfuscator.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; args.mtu as usize + 64];
+            let mut record_seq: u64 = 0;
             loop {
                 match tun.recv(&mut buf).await {
                     Ok(n) => {
-                        tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        if let Err(e) = socket.send_to(&buf[..n], peer).await {
+                        let plaintext = &buf[..n];
+                        let (on_wire, wants_rekey) = {
+                            let mut guard = session.lock().await;
+                            let data_wire = guard.encrypt_for_wire(0x01, plaintext);
+                            let mut outer = Vec::with_capacity(1 + data_wire.len());
+                            outer.push(handshake_wire::MSG_DATA);
+                            outer.extend_from_slice(&data_wire);
+                            let framed = obfuscator.wrap(&outer, record_seq);
+                            (framed, guard.should_rekey())
+                        };
+                        record_seq += 1;
+                        tx_bytes.fetch_add(on_wire.len() as u64, Ordering::Relaxed);
+                        if let Err(e) = socket.send_to(&on_wire, peer).await {
                             eprintln!("udp send error: {e}");
+                        }
+
+                        // Volume/time-based periodic rekey trigger, driven
+                        // by the real packet counter and Instant::now()
+                        // inside DhRatchetState (see should_rekey()).
+                        if wants_rekey {
+                            let offer_wire = {
+                                let mut guard = session.lock().await;
+                                guard.begin_rekey()
+                            };
+                            if let Err(e) = socket.send_to(&offer_wire, peer).await {
+                                eprintln!("rekey offer send error: {e}");
+                            }
                         }
                     }
                     Err(e) => {
@@ -152,15 +226,99 @@ async fn main() -> anyhow::Result<()> {
     let udp_to_tun = {
         let tun = tun.clone();
         let socket = socket.clone();
+        let peer = args.peer;
         let rx_bytes = rx_bytes.clone();
+        let session = session.clone();
+        let obfuscator = obfuscator.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; args.mtu as usize + 64];
+            let mut buf = vec![0u8; args.mtu as usize + 128];
             loop {
                 match socket.recv_from(&mut buf).await {
-                    Ok((n, _from)) => {
+                    Ok((n, from)) => {
+                        if from != peer {
+                            continue;
+                        }
                         rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                        if let Err(e) = tun.send(&buf[..n]).await {
-                            eprintln!("tun send error: {e}");
+
+                        // Control-plane messages (handshake/rekey/hello)
+                        // are never obfuscated (see handshake_wire.rs);
+                        // only data packets are. The DTLS content-type
+                        // byte (0x17) never collides with our control
+                        // message type tags (0..=5), so peeking at the
+                        // first byte is enough to tell them apart without
+                        // needing to know whether --obfuscate is active.
+                        let received = &buf[..n];
+                        let (msg_type, payload): (u8, &[u8]) =
+                            if !received.is_empty() && received[0] == DTLS_CONTENT_TYPE_APPLICATION_DATA {
+                                match obfuscator.unwrap(received) {
+                                    Ok(body) if !body.is_empty() => (body[0], &body[1..]),
+                                    Ok(_) => {
+                                        eprintln!("dropping packet: empty obfuscated body");
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("dropping packet: obfuscation unwrap failed: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else if !received.is_empty() {
+                                (received[0], &received[1..])
+                            } else {
+                                continue;
+                            };
+
+                        match msg_type {
+                            handshake_wire::MSG_DATA => {
+                                let plaintext = {
+                                    let mut guard = session.lock().await;
+                                    guard.decrypt_from_wire(payload)
+                                };
+                                match plaintext {
+                                    Ok(plaintext) => {
+                                        if let Err(e) = tun.send(&plaintext).await {
+                                            eprintln!("tun send error: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Drop on any decrypt failure; never
+                                        // write anything to TUN, never crash
+                                        // the loop.
+                                        eprintln!("dropping packet: decrypt failed: {e}");
+                                    }
+                                }
+                            }
+                            handshake_wire::MSG_REKEY_OFFER if role == Role::Responder => {
+                                // Full control-message bytes (msg_type +
+                                // payload) are what respond_to_rekey
+                                // expects -- reconstruct them since we
+                                // split them above for the data-packet
+                                // fast path.
+                                let mut full = vec![msg_type];
+                                full.extend_from_slice(payload);
+                                let result = {
+                                    let mut guard = session.lock().await;
+                                    guard.respond_to_rekey(&full)
+                                };
+                                match result {
+                                    Ok(response_wire) => {
+                                        if let Err(e) = socket.send_to(&response_wire, peer).await {
+                                            eprintln!("rekey response send error: {e}");
+                                        }
+                                    }
+                                    Err(e) => eprintln!("rekey offer rejected: {e}"),
+                                }
+                            }
+                            handshake_wire::MSG_REKEY_RESPONSE if role == Role::Initiator => {
+                                let mut full = vec![msg_type];
+                                full.extend_from_slice(payload);
+                                let mut guard = session.lock().await;
+                                if let Err(e) = guard.finish_rekey(&full) {
+                                    eprintln!("rekey response rejected: {e}");
+                                }
+                            }
+                            other => {
+                                eprintln!("dropping unexpected control message type {other} from {from}");
+                            }
                         }
                     }
                     Err(e) => {

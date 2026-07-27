@@ -37,6 +37,15 @@ impl Ratchet {
         self.chain_key = next_chain_key;
         packet_key
     }
+
+    /// Expose the raw chain key so a fresh receiving-side ratchet can be
+    /// bootstrapped from a `Ratchet` produced elsewhere (e.g. the DH
+    /// ratchet's rekey output), without duplicating chain-key derivation
+    /// logic. Crate-internal only -- callers outside `crypto` should never
+    /// need the raw bytes.
+    pub(crate) fn chain_key(&self) -> [u8; 32] {
+        self.chain_key
+    }
 }
 
 impl Drop for Ratchet {
